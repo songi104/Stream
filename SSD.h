@@ -74,7 +74,7 @@ public:
     void garbageCollectGreedy();
     double getCurrentTimeStamp();
     
-    void trimPage(Page* page);
+    //void trimPage(Page* page);
 
     void printOutput();
     

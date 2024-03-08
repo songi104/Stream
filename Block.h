@@ -19,6 +19,7 @@ public:
     
     int blockNumber;
     int invalidPageCount;
+    int blockStreamNumber;
 
     vector<Page*> pageInBlock;
     BlockState state;

@@ -13,7 +13,7 @@ Block::Block(int pagePerBlock) {
         physicalAddress++;
     }
     invalidPageCount = 0;
-
+    blockStreamNumber = -1; // when block in usedBlocksForGreedy, it should be not -1
 }
 
 Block::~Block() {

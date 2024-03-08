@@ -18,6 +18,9 @@ SSD::SSD(long long ssdCapacity, int blockCapacity, int pageCapacity)
 		blockInSSD[i] = new Block(pagePerBlock);
 		blockInSSD[i]->blockNumber = i;
 	}
+	for (int j = 0; j < 5; j++) {
+		blockInSSD[j]->blockStreamNumber = j;
+	}
 
 	mappingTable = new MappingTable(this);
 	ftl = new LogStructuredFTL(this, setting);
@@ -137,24 +140,31 @@ void LogStructuredFTL::write(double timeStamp, int logicalAddress) {
 	if (physicalAddress == -1) {
 		// Case1: No original write
 		int physicalAddress = logBlockNumbers[currentStreamNumber] * ssd->pagePerBlock + logPageOffsets[currentStreamNumber];
-		mappingTable->update(logicalAddress, physicalAddress, 1); //mapingTable update with new physicalAddress
+		mappingTable->logicalToPhysical.emplace(make_pair(logicalAddress, physicalAddress));
 		updatePageState(physicalAddress, PageState::VALID); //updatePageState with VALID
-		if (logPageOffsets[currentStreamNumber] == (ssd->pagePerBlock - 1)) { // Update Block State
-			updateBlockState(physicalAddress, BlockState::USED);
-		}
+
 	}
 	else {
 		// Case2: Original Write exists
 		int originalPhysicalAddress = physicalAddress;
 		int newPhysicalAddress = logBlockNumbers[currentStreamNumber] * ssd->pagePerBlock + logPageOffsets[currentStreamNumber];
 
-		// update PageState
-		mappingTable->update(logicalAddress, newPhysicalAddress, 0); //mapingTable update with new physicalAddress
-		updatePageState(originalPhysicalAddress, PageState::INVALID);
-		updatePageState(newPhysicalAddress, PageState::VALID);
-		if (logPageOffsets[currentStreamNumber] == (ssd->pagePerBlock - 1)) { // Update Block State
-			updateBlockState(newPhysicalAddress, BlockState::USED);
+		// update mappingTable
+		mappingTable->logicalToPhysical[logicalAddress] = physicalAddress;
+
+		//change old page's state to INVALID
+		int oldBlockNumber = originalPhysicalAddress / ssd->pagePerBlock;
+		int oldPageNumber = originalPhysicalAddress % ssd->pagePerBlock;
+		Page* oldPage = ssd->blockInSSD[oldBlockNumber]->pageInBlock[oldPageNumber];
+		if (oldPage->state == PageState::VALID) {
+			oldPage->state = PageState::INVALID;
+			ssd->blockInSSD[oldBlockNumber]->invalidPageCount++;
 		}
+
+		//change new page's state to VALID
+		Page* newPage = ssd->blockInSSD[logBlockNumbers[currentStreamNumber]]->pageInBlock[logPageOffsets[currentStreamNumber]];
+		newPage->state = PageState::VALID;
+
 	}
 
 	// 3. We need to update pageOffset
@@ -164,6 +174,7 @@ void LogStructuredFTL::write(double timeStamp, int logicalAddress) {
 
 		Block* oldBlock = ssd->blockInSSD[logBlockNumbers[currentStreamNumber]];
 		usedBlocksForGreedy.emplace_back(oldBlock->blockNumber, &oldBlock->invalidPageCount);
+		ssd->blockInSSD[oldBlock->blockNumber]->blockStreamNumber = currentStreamNumber;
 
 		logBlockNumbers[currentStreamNumber] = freeBlocksIndex.front();
 		freeBlocksIndex.pop_front();
@@ -277,47 +288,56 @@ void LogStructuredFTL::garbageCollectGreedy() {
 		return *(a.second) > *(b.second);
 		});
 
-	// 2. Check if the block has all invalid pages
-	int targetBlockNumber = usedBlocksForGreedy[0].first;
-	Block* targetBlock = ssd->blockInSSD[targetBlockNumber]; // block: get to be erased
+	int victimBlockNumber = usedBlocksForGreedy[0].first;
+	Block* victimBlock = ssd->blockInSSD[victimBlockNumber];
 
-	if (targetBlock->invalidPageCount == ssd->pagePerBlock) {
-		// Case 1) Block has all invalid pages
-		targetBlock->state = BlockState::FREE;
-		eraseCount++;
-		freeBlocksIndex.push_back(targetBlock->blockNumber);
-		usedBlocksForGreedy.erase(usedBlocksForGreedy.begin());
-		garbageCollectCount++;
-		this->ratio = double(validPageNumber) / (garbageCollectCount * (ssd->pagePerBlock));
+	// 2. Check if the block has all invalid pages
+	if (victimBlock->invalidPageCount == ssd->pagePerBlock) {
+	// Case 1) Block has all invalid pages
+		
 	}
 
 	else {
-		// Case 2) Block has partial valid pages
-		for (auto& page : targetBlock->pageInBlock) {
+	// Case 2) Block has partial valid pages
+		int victimStreamNumber = victimBlock->blockStreamNumber;
+		int victimBlockNumber = victimBlock->blockNumber;
+
+		//Error handling
+		try {
+			if (victimStreamNumber == -1) {
+				throw runtime_error("victimStreamNumber is -1");
+			}
+		}
+		catch (const std::runtime_error& e) {
+			cerr << "Error: " << e.what() << endl;
+		}
+
+		for (auto& page : victimBlock->pageInBlock) {
+
 			if (page->state == PageState::VALID) {
 				// Trim Page
 				
 				// 1. We already know physicalAddress
-				int originalPhysicalAddress = page->physicalAddress;
-				int newPhysicalAddress = logBlockNumbers[currentStreamNumber] * ssd->pagePerBlock + logPageOffsets[currentStreamNumber];
+				int victimPhysicalAddress = page->physicalAddress;
+				
+				int newBlockNumber = logBlockNumbers[victimStreamNumber];
+				int newPageOffset = logPageOffsets[victimStreamNumber];
+				int newPhysicalAddress = newBlockNumber* ssd->pagePerBlock + newPageOffset;
 
 				// 2. update mappingTable
-				mappingTable->update(originalPhysicalAddress, newPhysicalAddress, 0); //mapingTable update with new physicalAddress
+				mappingTable->logicalToPhysical[victimPhysicalAddress] = newPhysicalAddress;
 
-				// 3. update State
-				updatePageState(newPhysicalAddress, PageState::VALID);
-				if (logPageOffsets[currentStreamNumber] == (ssd->pagePerBlock - 1)) { // Update Block State
-					updateBlockState(newPhysicalAddress, BlockState::USED);
-				}
+				// 3. update State of new
+				ssd->blockInSSD[newBlockNumber]->pageInBlock[newPageOffset]->state = PageState::VALID;
 
 				// 4. We need to update logPage
-				logPageOffsets[currentStreamNumber]++;
-				if (logPageOffsets[currentStreamNumber] >= ssd->pagePerBlock) {
-					Block* oldBlock = ssd->blockInSSD[logBlockNumbers[currentStreamNumber]];
-					usedBlocksForGreedy.emplace_back(oldBlock->blockNumber, &oldBlock->invalidPageCount);
+				logPageOffsets[victimStreamNumber]++;
+				if (logPageOffsets[victimStreamNumber] >= ssd->pagePerBlock) {
+					usedBlocksForGreedy.emplace_back(victimBlockNumber, &victimBlock->invalidPageCount);
+					ssd->blockInSSD[victimBlockNumber]->blockStreamNumber = victimStreamNumber;
 
-					logPageOffsets[currentStreamNumber] = 0;
-					logBlockNumbers[currentStreamNumber] = freeBlocksIndex.front();
+					logPageOffsets[victimStreamNumber] = 0;
+					logBlockNumbers[victimStreamNumber] = freeBlocksIndex.front();
 					freeBlocksIndex.pop_front();
 				}
 
@@ -326,54 +346,25 @@ void LogStructuredFTL::garbageCollectGreedy() {
 				validPageNumber++;
 			}
 		}
-
-
-		targetBlock->state = BlockState::FREE;
-		targetBlock->invalidPageCount = 0;
-		freeBlocksIndex.push_back(targetBlock->blockNumber);
-		usedBlocksForGreedy.erase(usedBlocksForGreedy.begin());
-		
-		eraseCount++;
-		garbageCollectCount++;
-		this->ratio = double(validPageNumber) / (garbageCollectCount * (ssd->pagePerBlock));
 	}
 
+	usedBlocksForGreedy.erase(usedBlocksForGreedy.begin());
+	for (auto page : victimBlock->pageInBlock) {
+		page->state = PageState::ERASED;
+	}
 
+	victimBlock->state = BlockState::FREE;
+	victimBlock->invalidPageCount = 0;
+	victimBlock->blockStreamNumber = -1;
+	freeBlocksIndex.push_back(victimBlock->blockNumber);
+
+	eraseCount++;
+	garbageCollectCount++;
+	this->ratio = double(validPageNumber) / (garbageCollectCount * (ssd->pagePerBlock));
 
 };
 
 
-// trim for GC
-void LogStructuredFTL::trimPage(Page* page) {
-
-	// 1. We already know physicalAddress
-	int originalPhysicalAddress = page->physicalAddress;
-	int newPhysicalAddress = logBlockNumbers[currentStreamNumber] * ssd->pagePerBlock + logPageOffsets[currentStreamNumber];
-
-	// 2. update mappingTable
-	mappingTable->update(originalPhysicalAddress, newPhysicalAddress, 0); //mapingTable update with new physicalAddress
-
-	// 3. update State
-	updatePageState(newPhysicalAddress, PageState::VALID);
-	if (logPageOffsets[currentStreamNumber] == (ssd->pagePerBlock - 1)) { // Update Block State
-		updateBlockState(newPhysicalAddress, BlockState::USED);
-	}
-
-	// 4. We need to update logPage
-	logPageOffsets[currentStreamNumber]++;
-	if (logPageOffsets[currentStreamNumber] >= ssd->pagePerBlock) {
-		Block* oldBlock = ssd->blockInSSD[logBlockNumbers[currentStreamNumber]];
-		usedBlocksForGreedy.emplace_back(oldBlock->blockNumber, &oldBlock->invalidPageCount);
-
-		logPageOffsets[currentStreamNumber] = 0;
-		logBlockNumbers[currentStreamNumber] = freeBlocksIndex.front();
-		freeBlocksIndex.pop_front();
-	}
-
-	totalWriteCount++;
-	totalWriteCount_tmp++;
-
-}
 
 
 void LogStructuredFTL::updateBlockState(int physicalAddress, BlockState newState) {
@@ -418,7 +409,6 @@ void LogStructuredFTL::updatePageState(int physicalAddress, PageState pageState)
 	PageState* originalState = &ssd->blockInSSD[blockNumber]->pageInBlock[pageNumber]->state;
 	if (*originalState == PageState::VALID) {
 		if (pageState == PageState::INVALID) {
-			ssd->blockInSSD[blockNumber]->invalidPageCount++;
 		}
 	}
 	*originalState = pageState;
