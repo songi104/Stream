@@ -173,7 +173,8 @@ void LogStructuredFTL::write(double timeStamp, int logicalAddress) {
 		logPageOffsets[currentStreamNumber] = 0;
 
 		Block* oldBlock = ssd->blockInSSD[logBlockNumbers[currentStreamNumber]];
-		usedBlocksForGreedy.emplace_back(oldBlock->blockNumber, &oldBlock->invalidPageCount);
+		usedBlocksForGreedy.push_back(make_pair(oldBlock->blockNumber, &oldBlock->invalidPageCount));
+		ssd->blockInSSD[oldBlock->blockNumber]->state = BlockState::USED;
 		ssd->blockInSSD[oldBlock->blockNumber]->blockStreamNumber = currentStreamNumber;
 
 		logBlockNumbers[currentStreamNumber] = freeBlocksIndex.front();
@@ -184,7 +185,7 @@ void LogStructuredFTL::write(double timeStamp, int logicalAddress) {
 	while (freeBlocksIndex.size() < 2) {
 		if (strategy == GarbageCollectionStrategy::FIFO)
 		{
-			garbageCollect(0);
+			//garbageCollect(0);
 		}
 		else if (strategy == GarbageCollectionStrategy::Greedy) {
 			garbageCollectGreedy();
@@ -202,84 +203,7 @@ void LogStructuredFTL::write(double timeStamp, int logicalAddress) {
 int validPageNumber = 0;
 int garbageCollectCount = 0;
 
-void LogStructuredFTL::garbageCollect(int idx) {
-	//FIFO
-	pair<double, int> victim = usedBlocks[idx];
-	int blockNumber = victim.second;
-	Block* block = ssd->blockInSSD[blockNumber];
 
-	// Check all page states in the block
-	bool allInvalid = true;
-	bool allValid = true;
-
-	for (const auto& page : block->pageInBlock) {
-		if (page->state == PageState::VALID) {
-			allInvalid = false;
-			if (allValid == false) { break; }
-		}
-		else {
-			allValid = false;
-			if (allInvalid == false) { break; }
-		}
-	}
-
-	if (allInvalid) {
-		// Case 1: Block has all invalid pages, ERASE the block
-		block->state = BlockState::FREE;
-		eraseCount++;
-		usedBlocks.erase(usedBlocks.begin());
-		garbageCollectCount++;
-		freeBlocksIndex.push_back(block->blockNumber);
-	}
-	else if (allValid) { //TODO: how to handle this case? -> 일단 그냥 옮기기만한다
-		// Case 2: Block has all valid pages
-		usedBlocks.erase(usedBlocks.begin());
-		double timeStamp = this->currentTimestamp;
-		usedBlocks.emplace_back(timeStamp, block->blockNumber);
-		garbageCollectCount++;
-		return;
-	}
-	else {
-		// Case 3: Block has part of valid pages
-		// trim the pages
-
-		for (auto& page : block->pageInBlock) {
-			if (page->state == PageState::VALID) { //trim part
-				// 4. We need to update logPage
-				logPageOffsets[currentStreamNumber]++;
-				if (logPageOffsets[currentStreamNumber] >= ssd->pagePerBlock) {
-					logPageOffsets[currentStreamNumber] = 0;
-					logBlockNumbers[currentStreamNumber] = freeBlocksIndex.front();
-					freeBlocksIndex.pop_front();
-				}
-
-				// 1. We already know physicalAddress
-				int originalPhysicalAddress = page->physicalAddress;
-				int newPhysicalAddress = logBlockNumbers[currentStreamNumber] * ssd->pagePerBlock + logPageOffsets[currentStreamNumber];
-
-				// 2. update mappingTable
-				mappingTable->update(originalPhysicalAddress, newPhysicalAddress, 0); //mapingTable update with new physicalAddress
-
-				// 3. update State
-				updatePageState(newPhysicalAddress, PageState::VALID);
-				updateBlockState(newPhysicalAddress, BlockState::USED);
-
-
-
-				totalWriteCount++;
-				totalWriteCount_tmp++;
-				validPageNumber++;
-			}
-		}
-		block->state = BlockState::FREE;
-		eraseCount++;
-		usedBlocks.erase(usedBlocks.begin());
-		freeBlocksIndex.push_back(block->blockNumber);
-		double timeStamp = this->currentTimestamp;
-		garbageCollectCount++;
-		this->ratio = double(validPageNumber) / (garbageCollectCount * (ssd->pagePerBlock));
-	}
-}
 
 void LogStructuredFTL::garbageCollectGreedy() {
 
@@ -297,8 +221,8 @@ void LogStructuredFTL::garbageCollectGreedy() {
 		
 	}
 
-	else {
-	// Case 2) Block has partial valid pages
+	else {// Case 2) Block has partial valid pages
+	
 		int victimStreamNumber = victimBlock->blockStreamNumber;
 		int victimBlockNumber = victimBlock->blockNumber;
 
@@ -322,9 +246,10 @@ void LogStructuredFTL::garbageCollectGreedy() {
 				
 				int newBlockNumber = logBlockNumbers[victimStreamNumber];
 				int newPageOffset = logPageOffsets[victimStreamNumber];
+				Block* newBlock = ssd->blockInSSD[newBlockNumber];
 				int newPhysicalAddress = newBlockNumber* ssd->pagePerBlock + newPageOffset;
 
-				// 2. update mappingTable
+				// 2. update mappingTable ((TODO: victimPhysical이 아니라 logical 아님?))
 				mappingTable->logicalToPhysical[victimPhysicalAddress] = newPhysicalAddress;
 
 				// 3. update State of new
@@ -333,8 +258,9 @@ void LogStructuredFTL::garbageCollectGreedy() {
 				// 4. We need to update logPage
 				logPageOffsets[victimStreamNumber]++;
 				if (logPageOffsets[victimStreamNumber] >= ssd->pagePerBlock) {
-					usedBlocksForGreedy.emplace_back(victimBlockNumber, &victimBlock->invalidPageCount);
-					ssd->blockInSSD[victimBlockNumber]->blockStreamNumber = victimStreamNumber;
+					usedBlocksForGreedy.push_back(make_pair(newBlockNumber, &newBlock->invalidPageCount));
+					ssd->blockInSSD[newBlockNumber]->blockStreamNumber = victimStreamNumber;
+					ssd->blockInSSD[newBlockNumber]->state = BlockState::USED;
 
 					logPageOffsets[victimStreamNumber] = 0;
 					logBlockNumbers[victimStreamNumber] = freeBlocksIndex.front();
@@ -366,42 +292,6 @@ void LogStructuredFTL::garbageCollectGreedy() {
 
 
 
-
-void LogStructuredFTL::updateBlockState(int physicalAddress, BlockState newState) {
-	int blockNumber = physicalAddress / (ssd->pagePerBlock);
-	Block* block = ssd->blockInSSD[blockNumber];
-
-	if (block->state == newState) {
-		return;
-	}
-	else { //다를 시에
-		if (newState == BlockState::FREE) {
-
-			//kick out from used Block
-			auto it = remove_if(usedBlocks.begin(), usedBlocks.end(),
-				[blockNumber](const auto& pair) {
-					return pair.second == blockNumber;
-				});
-			usedBlocks.erase(it);
-			freeBlocksIndex.push_back(blockNumber);
-
-		}
-
-		else if (newState == BlockState::USED) {
-			block->state = newState;
-			if (strategy == FIFO) {
-				double timestamp = this->currentTimestamp;
-				usedBlocks.emplace_back(timestamp, blockNumber);
-			}
-			else {//Greedy
-			}
-		}
-	}
-}
-
-double LogStructuredFTL::getCurrentTimeStamp() {
-	return this->currentTimestamp;
-}
 
 void LogStructuredFTL::updatePageState(int physicalAddress, PageState pageState) {
 	int blockNumber = physicalAddress / ssd->pagePerBlock;

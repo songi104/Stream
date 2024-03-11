@@ -68,11 +68,9 @@ public:
     void write(double timeStamp, int logicalAddress) override;
     void updatePageState(int physicalAddress, PageState pageState);
     void updateLogBlock();
-    void updateBlockState(int physicalAddress, BlockState newState);
     
     void garbageCollect(int idx);
     void garbageCollectGreedy();
-    double getCurrentTimeStamp();
     
     //void trimPage(Page* page);
 
